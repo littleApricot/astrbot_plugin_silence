@@ -44,7 +44,15 @@ class SilenceTests(unittest.IsolatedAsyncioTestCase):
             PlatformMetadata('qq_official', 'qq_official', 'test'), 'group'
         )
         event.send = AsyncMock()
-        plugin = Silence(SimpleNamespace())
+        database_write = AsyncMock()
+        database = SimpleNamespace(update_conversation=database_write)
+
+        async def save(unified_msg_origin, conversation_id, history, **kwargs):
+            await database.update_conversation(conversation_id, content=history)
+
+        manager = SimpleNamespace(db=database, update_conversation=AsyncMock(side_effect=save))
+        plugin = Silence(SimpleNamespace(conversation_manager=manager))
+        self.addAsyncCleanup(plugin.terminate)
         silence = copy.copy(llm_tools.get_func('silence'))
         self.assertEqual(silence.parameters.get('properties'), {})
         silence.handler = plugin.silence
@@ -69,7 +77,8 @@ class SilenceTests(unittest.IsolatedAsyncioTestCase):
                 ))
             responses.append(LLMResponse(
                 role='assistant', tools_call_name=['silence'],
-                tools_call_args=[{}], tools_call_ids=['silence-1']
+                tools_call_args=[{}], tools_call_ids=['silence-1'],
+                reasoning_content='PRIVATE_SILENCE_REASONING'
             ))
             provider = MagicMock(spec=Provider)
             provider.provider_config = {'modalities': ['text']}
@@ -99,17 +108,18 @@ class SilenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(provider.text_chat.await_count, 2 if with_action else 1)
             if with_action:
                 self.assertEqual(json.loads(path.read_text()), {'completed': True})
-            stage = SimpleNamespace(
-                conv_manager=SimpleNamespace(update_conversation=AsyncMock())
-            )
+            stage = SimpleNamespace(conv_manager=manager)
             await InternalAgentSubStage._save_to_history(
                 stage, event, request, runner.get_final_llm_resp(),
                 runner.run_context.messages, runner.stats
             )
             stage.conv_manager.update_conversation.assert_awaited_once()
-            history = stage.conv_manager.update_conversation.await_args.kwargs['history']
+            history = database_write.await_args.kwargs['content']
             results = {m['tool_call_id']: m for m in history if m.get('role') == 'tool'}
-            self.assertIn('silence-1', results)
+            self.assertNotIn('silence-1', results)
+            self.assertNotIn('PRIVATE_SILENCE_REASONING', str(history))
+            self.assertNotIn('silence-1', str(history))
+            self.assertTrue(event.get_extra('silence_completed'))
             if with_action:
                 self.assertTrue(json.loads(results['action-1']['content'])['ok'])
             self.assertFalse(any(
